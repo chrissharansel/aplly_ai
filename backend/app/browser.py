@@ -22,7 +22,7 @@ async def fill(sid,items):
  page=sessions[sid]['page'];out=[]
  for x in items:
   try:
-   loc=page.locator('input:not([type=hidden]),textarea,select,button').filter(visible=True).nth(x['index']);tag=await loc.evaluate('(e)=>e.tagName.toLowerCase()');typ=await loc.get_attribute('type') or ''
+   loc=page.locator('input:not([type=hidden]):visible,textarea:visible,select:visible,button:visible').nth(x['index']);tag=await loc.evaluate('(e)=>e.tagName.toLowerCase()');typ=await loc.get_attribute('type') or ''
    if tag=='select':await loc.select_option(label=str(x['value']))
    elif tag=='button' or typ in ('submit','button','file','checkbox','radio','password'):raise ValueError('manual control')
    else:await loc.fill(str(x['value']))
@@ -30,7 +30,7 @@ async def fill(sid,items):
   except Exception as e:out.append({'index':x['index'],'status':'manual','reason':type(e).__name__})
  return out
 async def enter_answer(sid,index,value):
- p=sessions[sid]['page'];loc=p.locator('input:not([type=hidden]),textarea,select,button').filter(visible=True).nth(index)
+ p=sessions[sid]['page'];loc=p.locator('input:not([type=hidden]):visible,textarea:visible,select:visible,button:visible').nth(index)
  if await loc.evaluate('(e)=>e.tagName.toLowerCase()')=='select':await loc.select_option(label=value)
  else:await loc.fill(value)
 async def submit(sid):

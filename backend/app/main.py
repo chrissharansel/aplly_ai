@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import asyncio
 from datetime import datetime,timezone
 from uuid import uuid4
 from pathlib import Path
@@ -8,7 +9,10 @@ from pydantic import BaseModel,EmailStr,Field
 from app.config import settings
 from app.db import db,ping,init,close
 from app.security import user,hashpw,checkpw,token
-from app.llm import resume_extract
+from app.llm import resume_extract, ask
+from app.document_intelligence.processor import extract_document
+from app.document_intelligence.summarizer import summarize_chunks
+from app.agents import answer_document_question
 from app.browser import inspect,fill,enter_answer,submit,validate
 from pypdf import PdfReader
 from docx import Document
@@ -45,23 +49,231 @@ def login(x:Login):
  u=db().users.find_one({'email':x.email.lower()})
  if not u or not checkpw(x.password,u['password_hash']):raise HTTPException(401,'Incorrect email or password')
  return {'access_token':token(u['_id']),'user':{'id':u['_id'],'email':u['email'],'full_name':u['full_name']}}
+
+# Resume extraction jobs expose real backend stages to the React UI.
+RESUME_JOBS: dict[str, dict] = {}
+
+
+def _set_resume_job(job_id: str, **updates):
+ job = RESUME_JOBS.get(job_id)
+ if job is not None:
+  job.update(updates)
+
+
+async def _run_resume_job(job_id: str, raw: bytes, name: str, ext: str, content_type: str, user_id: str):
+ try:
+  _set_resume_job(job_id, status='running', stage='extracting', percent=8,
+                  message='Reading your document and extracting text…',
+                  steps=[{'label':'Upload received','status':'done'},
+                         {'label':'Read PDF / Word content','status':'active'},
+                         {'label':'Analyse resume with Ollama','status':'waiting'},
+                         {'label':'Save document and profile to MongoDB','status':'waiting'}])
+  extracted = await asyncio.to_thread(extract_document, raw, ext)
+  if not extracted.get('text', '').strip():
+   raise ValueError('No readable text could be extracted from this document.')
+
+  _set_resume_job(job_id, stage='analysing', percent=25,
+                  message=f"Extracted {len(extracted['text']):,} characters in {len(extracted['chunks'])} chunks. Analysing with {settings.ollama_model}…",
+                  steps=[{'label':'Upload received','status':'done'},
+                         {'label':'Read PDF / Word content','status':'done'},
+                         {'label':'Analyse resume with Ollama','status':'active'},
+                         {'label':'Save document and profile to MongoDB','status':'waiting'}],
+                  document_stats={'pages':extracted['page_count'], 'characters':len(extracted['text']), 'chunks':len(extracted['chunks']), 'method':extracted['extraction_method']})
+
+  async def report_chunk(index, total):
+   # Reserve 25–82% for model extraction; this reflects actual completed chunks.
+   percent = 25 + int((index / max(total, 1)) * 57)
+   _set_resume_job(job_id, percent=percent, message=f'AI is analysing resume section {index} of {total}…',
+                   current_chunk=index, total_chunks=total)
+
+  data = await resume_extract(extracted['text'], progress_callback=report_chunk)
+  _set_resume_job(job_id, stage='saving', percent=88,
+                  message='AI extraction complete. Saving document, chunks and candidate profile to MongoDB…',
+                  steps=[{'label':'Upload received','status':'done'},
+                         {'label':'Read PDF / Word content','status':'done'},
+                         {'label':'Analyse resume with Ollama','status':'done'},
+                         {'label':'Save document and profile to MongoDB','status':'active'}])
+
+  rid = str(uuid4())
+  doc_id = str(uuid4())
+  db().documents.insert_one({
+   '_id':doc_id,'user_id':user_id,'resume_id':rid,'filename':name,
+   'extension':ext,'mime_type':content_type,'document_type':'resume','file_data':raw,
+   'page_count':extracted['page_count'],'title':extracted['title'],
+   'extraction_method':extracted['extraction_method'],
+   'character_count':len(extracted['text']),'chunk_count':len(extracted['chunks']),
+   'summary':None,'profile_extraction':data,'verified':False,'created_at':now()
+  })
+  chunk_docs=[{'user_id':user_id,'document_id':doc_id,'chunk_index':i,'text':chunk,'created_at':now()} for i,chunk in enumerate(extracted['chunks'])]
+  if chunk_docs:
+   db().document_chunks.insert_many(chunk_docs)
+  db().resumes.insert_one({'_id':rid,'user_id':user_id,'document_id':doc_id,'filename':name,
+                           'verified':False,'status':'pending_review',
+                           'extraction_method':extracted['extraction_method'],'created_at':now()})
+  result={'resume_id':rid,'document_id':doc_id,'filename':name,'profile':data,'verified':False,
+          'document':{'page_count':extracted['page_count'],'character_count':len(extracted['text']),
+                      'chunk_count':len(extracted['chunks']),'extraction_method':extracted['extraction_method']},
+          'notice':'Document stored. Review and confirm extracted candidate information before it becomes trusted knowledge.'}
+  _set_resume_job(job_id, status='completed', stage='completed', percent=100,
+                  message='Resume analysis and MongoDB storage completed. Review your extracted profile.',
+                  steps=[{'label':'Upload received','status':'done'},
+                         {'label':'Read PDF / Word content','status':'done'},
+                         {'label':'Analyse resume with Ollama','status':'done'},
+                         {'label':'Save document and profile to MongoDB','status':'done'}],
+                  result=result, completed_at=now().isoformat())
+ except Exception as exc:
+  import logging
+  logging.exception('Resume analysis job failed')
+  _set_resume_job(job_id, status='failed', stage='failed', percent=100,
+                  message=f'{type(exc).__name__}: {str(exc) or repr(exc)}', error=str(exc) or repr(exc))
+
+
 @app.post('/api/resumes/analyze')
 async def upload(file:UploadFile=File(...),u=Depends(user)):
- name=Path(file.filename or 'resume').name;ext=Path(name).suffix.lower()
- if ext not in ('.pdf','.docx'):raise HTTPException(400,'PDF or DOCX only')
+ name=Path(file.filename or 'resume').name
+ ext=Path(name).suffix.lower()
+ if ext not in ('.pdf','.docx'):
+  raise HTTPException(400,'PDF or DOCX only')
  raw=await file.read()
- if not raw or len(raw)>settings.max_upload_mb*1024*1024:raise HTTPException(413,'Empty file or upload size limit exceeded')
- folder=Path(__file__).resolve().parents[1]/'storage'/'resumes';folder.mkdir(parents=True,exist_ok=True);rid=str(uuid4());path=folder/(u['id']+'_'+rid+ext);path.write_bytes(raw)
+ if not raw or len(raw)>settings.max_upload_mb*1024*1024:
+  raise HTTPException(413,'Empty file or upload size limit exceeded')
+ job_id=str(uuid4())
+ RESUME_JOBS[job_id]={'job_id':job_id,'user_id':u['id'],'status':'queued','stage':'queued','percent':2,
+                      'message':'Upload received. Waiting for document processing…',
+                      'steps':[{'label':'Upload received','status':'done'},
+                               {'label':'Read PDF / Word content','status':'waiting'},
+                               {'label':'Analyse resume with Ollama','status':'waiting'},
+                               {'label':'Save document and profile to MongoDB','status':'waiting'}]}
+ asyncio.create_task(_run_resume_job(job_id,raw,name,ext,file.content_type or '',u['id']))
+ return {'job_id':job_id,'status':'queued','message':'Resume processing started.'}
+
+
+@app.get('/api/resumes/analyze/{job_id}')
+def resume_job_status(job_id:str,u=Depends(user)):
+ job=RESUME_JOBS.get(job_id)
+ if not job or job.get('user_id') != u['id']:
+  raise HTTPException(404,'Resume processing job not found.')
+ return {k:v for k,v in job.items() if k != 'user_id'}
+
+
+
+@app.post('/api/documents/upload')
+async def upload_reference_document(file:UploadFile=File(...),u=Depends(user)):
+ name=Path(file.filename or 'document').name
+ ext=Path(name).suffix.lower()
+ if ext not in ('.pdf','.docx'):
+  raise HTTPException(400,'Only PDF and DOCX documents are supported.')
+ raw=await file.read()
+ if not raw or len(raw)>settings.max_upload_mb*1024*1024:
+  raise HTTPException(413,'Empty file or upload size limit exceeded.')
  try:
-  if ext=='.pdf':text='\n'.join(p.extract_text() or '' for p in PdfReader(str(path)).pages)
-  else:
-   doc=Document(str(path));text='\n'.join([p.text for p in doc.paragraphs]+[' | '.join(c.text for c in r.cells) for t in doc.tables for r in t.rows])
-  if not text.strip():raise ValueError('No readable text; scanned PDF OCR is not included')
-  data=await resume_extract(text)
+  extracted=extract_document(raw,ext)
+ except ValueError as e:
+  raise HTTPException(422,str(e))
+ doc_id=str(uuid4())
+ db().documents.insert_one({
+  '_id':doc_id,'user_id':u['id'],'filename':name,'extension':ext,
+  'mime_type':file.content_type or '','file_data':raw,
+  'page_count':extracted['page_count'],'title':extracted['title'],
+  'extraction_method':extracted['extraction_method'],
+  'character_count':len(extracted['text']),'chunk_count':len(extracted['chunks']),
+  'document_type':'reference','summary':None,'verified':False,'created_at':now()
+ })
+ chunk_docs=[{
+  'user_id':u['id'],'document_id':doc_id,'chunk_index':i,
+  'text':chunk,'created_at':now()
+ } for i,chunk in enumerate(extracted['chunks'])]
+ if chunk_docs:db().document_chunks.insert_many(chunk_docs)
+ return {
+  'document_id':doc_id,'filename':name,
+  'document':{'page_count':extracted['page_count'],
+              'character_count':len(extracted['text']),
+              'chunk_count':len(extracted['chunks']),
+              'extraction_method':extracted['extraction_method']},
+  'stored':True
+}
+
+@app.get('/api/documents')
+def list_documents(u=Depends(user)):
+ items=list(db().documents.find(
+  {'user_id':u['id']},
+  {'file_data':0,'profile_extraction':0}
+ ).sort('created_at',-1).limit(100))
+ for item in items:
+  item['id']=item.pop('_id')
+ return {'items':items}
+
+@app.get('/api/documents/{document_id}')
+def get_document(document_id:str,u=Depends(user)):
+ item=db().documents.find_one({'_id':document_id,'user_id':u['id']},{
+  'file_data':0
+ })
+ if not item:raise HTTPException(404,'Document not found')
+ item['id']=item.pop('_id')
+ return item
+
+@app.post('/api/documents/{document_id}/ask')
+async def ask_document(document_id:str,x:dict,u=Depends(user)):
+ question=str(x.get('question','')).strip()
+ if not question or len(question)>2000:
+  raise HTTPException(400,'Enter a question (maximum 2,000 characters).')
+ try:
+  result=await answer_document_question(u['id'],document_id,question)
+  db().document_qa.insert_one({
+   'user_id':u['id'],'document_id':document_id,'question':question,
+   'answer':result['answer'],'tools_used':result['tools_used'],'created_at':now()
+  })
+  return result
+ except ValueError as e:
+  raise HTTPException(404,str(e))
  except Exception as e:
-  path.unlink(missing_ok=True);raise HTTPException(422,'Resume analysis failed: '+str(e))
- db().resumes.insert_one({'_id':rid,'user_id':u['id'],'filename':name,'path':str(path),'verified':False,'status':'pending_review','created_at':now()})
- return {'resume_id':rid,'profile':data,'verified':False}
+  import logging
+  logging.exception("Document Q&A failed")
+  raise HTTPException(502,f"Document Q&A failed ({type(e).__name__}): {str(e) or repr(e)}")
+
+
+@app.get('/api/documents/{document_id}/history')
+def document_history(document_id:str,u=Depends(user)):
+ if not db().documents.find_one({'_id':document_id,'user_id':u['id']},{'_id':1}):
+  raise HTTPException(404,'Document not found')
+ items=list(db().document_qa.find(
+  {'user_id':u['id'],'document_id':document_id},
+  {'_id':0,'question':1,'answer':1,'tools_used':1,'created_at':1}
+ ).sort('created_at',1).limit(100))
+ return {'items':items}
+
+@app.post('/api/documents/{document_id}/summary')
+async def summarize_document(document_id:str,u=Depends(user)):
+ doc=db().documents.find_one({'_id':document_id,'user_id':u['id']})
+ if not doc:raise HTTPException(404,'Document not found')
+ if doc.get('summary'):
+  return {'summary':doc['summary'],'cached':True}
+ chunks=list(db().document_chunks.find(
+  {'user_id':u['id'],'document_id':document_id},
+  {'_id':0,'text':1}
+ ).sort('chunk_index',1))
+ text='\n\n'.join(item['text'] for item in chunks)
+ try:
+  summary=await summarize_chunks([item['text'] for item in chunks])
+  db().documents.update_one({'_id':document_id,'user_id':u['id']},{'$set':{'summary':summary,'summary_created_at':now()}})
+  db().document_summaries.insert_one({'user_id':u['id'],'document_id':document_id,'summary':summary,'created_at':now()})
+  return {'summary':summary,'cached':False}
+ except Exception as e:
+  import logging
+  logging.exception("Document summary failed")
+  raise HTTPException(502,f"Summary generation failed ({type(e).__name__}): {str(e) or repr(e)}")
+
+@app.delete('/api/documents/{document_id}')
+def delete_document(document_id:str,u=Depends(user)):
+ doc=db().documents.find_one({'_id':document_id,'user_id':u['id']})
+ if not doc:raise HTTPException(404,'Document not found')
+ db().document_chunks.delete_many({'user_id':u['id'],'document_id':document_id})
+ db().document_qa.delete_many({'user_id':u['id'],'document_id':document_id})
+ db().document_summaries.delete_many({'user_id':u['id'],'document_id':document_id})
+ db().resumes.delete_many({'user_id':u['id'],'document_id':document_id})
+ db().documents.delete_one({'_id':document_id,'user_id':u['id']})
+ return {'deleted':True}
+
 @app.get('/api/profile')
 def get_profile(u=Depends(user)):
  d=db().candidate_profiles.find_one({'user_id':u['id']});return {'profile':d.get('profile') if d else None,'verified':bool(d and d.get('verified'))}
@@ -69,7 +281,23 @@ def get_profile(u=Depends(user)):
 def save_profile(x:ProfileSave,u=Depends(user)):
  if x.resume_id and not db().resumes.find_one({'_id':x.resume_id,'user_id':u['id']}):raise HTTPException(404,'Resume not found')
  db().candidate_profiles.update_one({'user_id':u['id']},{'$set':{'profile':x.profile,'verified':True,'updated_at':now()}},upsert=True)
- if x.resume_id:db().resumes.update_one({'_id':x.resume_id},{'$set':{'verified':True,'status':'confirmed'}})
+ if x.resume_id:db().resumes.update_one({'_id':x.resume_id,'user_id':u['id']},{'$set':{'verified':True,'status':'confirmed'}})
+ # Only user-confirmed profile facts enter the reusable knowledge base.
+ reusable_fields=('full_name','email','phone','location','headline','summary','total_experience','skills','education','experience','certifications','projects','links')
+ for key in reusable_fields:
+  value=x.profile.get(key)
+  if value not in (None,'',[],{}):
+   question='Candidate '+key.replace('_',' ')
+   answer_text=value if isinstance(value,str) else __import__('json').dumps(value,ensure_ascii=False)
+   db().knowledge_base.update_one(
+    {'user_id':u['id'],'category':'confirmed_profile','question':question},
+    {'$set':{'answer':answer_text,'verified':True,'reusable':True,'source':'user_confirmed_profile','updated_at':now()}},
+    upsert=True
+   )
+ if x.resume_id:
+  resume=db().resumes.find_one({'_id':x.resume_id,'user_id':u['id']})
+  if resume and resume.get('document_id'):
+   db().documents.update_one({'_id':resume['document_id'],'user_id':u['id']},{'$set':{'verified':True,'confirmed_at':now()}})
  return {'saved':True,'verified':True}
 @app.get('/api/knowledge')
 def list_knowledge(u=Depends(user)):
